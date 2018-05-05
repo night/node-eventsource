@@ -1,0 +1,11 @@
+{
+  "name": "node-eventsource",
+  "description": "an eventsource client lib that doesn't suffer from autoreconnection issues",
+  "version": "0.0.1",
+  "dependencies": {
+    "backoff": "^2.5.0",
+    "node-fetch": "^2.1.2"
+  },
+  "main": "./eventsource",
+  "license": "MIT"
+}
