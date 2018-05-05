@@ -6,7 +6,7 @@ The official eventsource library has some [reconnect](https://github.com/EventSo
 
 ```
 const es = new EventSource('https://example.tld/path/to/sse-endpoint');
-es.on('connecting', () => console.log('connecting));
+es.on('connecting', () => console.log('connecting'));
 es.on('connected', () => console.log('connected'));
 es.on('disconnected', () => console.log('disconnected'));
 es.on('some_event_name', ({id, name, data}) => console.log(id, name, data));
