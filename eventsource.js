@@ -14,6 +14,7 @@ const ReadyStates = {
 const DefaultOptions = {
     initialReconnectDelay: 2 * 1000,
     maximumReconnectDelay: 30 * 1000,
+    heartbeatTimeout: 30 * 1000,
 };
 
 class EventSourceEvent {
@@ -69,15 +70,15 @@ class EventSource extends EventEmitter {
     constructor(url, options = {}) {
         super();
 
-        options = {...DefaultOptions, ...options};
-
+        this.options = {...DefaultOptions, ...options};
         this.url = url;
         this.readyState = ReadyStates.DISCONNECTED;
         this.lastEventId = null;
+        this.heartbeatTimeout = null;
 
         this.backoff = backoff.exponential({
-            initialDelay: options.initialReconnectDelay,
-            maxDelay: options.maximumReconnectDelay,
+            initialDelay: this.options.initialReconnectDelay,
+            maxDelay: this.options.maximumReconnectDelay,
         });
         this.backoff.on('ready', () => this.connect());
 
@@ -106,6 +107,16 @@ class EventSource extends EventEmitter {
         });
     }
 
+    resetHeartbeatTimeout(callback) {
+        if (this.heartbeatTimeout) {
+            clearTimeout(this.heartbeatTimeout);
+        }
+        this.heartbeatTimeout = setTimeout(
+            () => callback(new Error(`no heartbeat from server in ${this.options.heartbeatTimeout}ms`)),
+            this.options.heartbeatTimeout
+        );
+    }
+
     handleResponse(response) {
         return new Promise((resolve, reject) => {
             if (!response.ok) {
@@ -126,6 +137,8 @@ class EventSource extends EventEmitter {
 
             let buffer = '';
             response.body.on('data', chunk => {
+                this.resetHeartbeatTimeout(err => response.body.destroy(err));
+
                 buffer += chunk.toString('utf8');
 
                 const bufferedEvents = buffer.split(EVENT_ENDING_REGEX);
