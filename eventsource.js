@@ -1,166 +1,198 @@
 const EventEmitter = require('events').EventEmitter;
-const fetch = require('node-fetch');
+const undici = require('undici');
 const backoff = require('backoff');
-
-const EVENT_ENDING_REGEX = /(?:\r|\n|\r\n)(?:\r|\n|\r\n)/;
-const LINE_ENDING_REGEX = /(?:\r|\n|\r\n)/;
+const {Writable} = require('stream');
 
 const ReadyStates = {
-    CONNECTING: 0,
-    CONNECTED: 1,
-    DISCONNECTED: 2,
+  CONNECTING: 0,
+  CONNECTED: 1,
+  DISCONNECTED: 2,
 };
+
+const COLON_CHARACTER = 58;
+const SPACE_CHARACTER = 32;
+const LINE_FEED_CHARACTER = 10;
+const CARRIAGE_RETURN_CHARACTER = 13;
 
 const DefaultOptions = {
-    initialReconnectDelay: 2 * 1000,
-    maximumReconnectDelay: 30 * 1000,
-    heartbeatTimeout: 30 * 1000,
+  initialReconnectDelay: 2 * 1000,
+  maximumReconnectDelay: 30 * 1000,
+  heartbeatTimeout: 30 * 1000,
 };
 
-class EventSourceEvent {
-    constructor(data) {
-        let eventId = null;
-        let eventName = '';
-        let eventData = '';
-
-        const lines = data.split(LINE_ENDING_REGEX);
-        for (const line of lines) {
-            if (line.startsWith(':')) continue;
-
-            const colonIndex = line.indexOf(':');
-            let fieldName = '';
-            let fieldValue = '';
-            if (colonIndex > -1) {
-                fieldName = line.substr(0, colonIndex);
-                fieldValue = line.substr(colonIndex + 1);
-                if (fieldValue.startsWith(' ')) {
-                    fieldValue = fieldValue.substr(1);
-                }
-            } else {
-                fieldName = line;
-                fieldValue = '';
-            }
-
-            switch (fieldName) {
-                case 'event':
-                    eventName = fieldValue;
-                    break;
-                case 'data':
-                    eventData += fieldValue + '\n';
-                    break;
-                case 'id':
-                    if (!fieldValue.includes('\0')) {
-                        eventId = fieldValue;
-                    }
-                    break;
-            }
-        }
-
-        this.id = eventId;
-        this.name = eventName || 'message';
-        this.data = eventData;
-    }
-
-    get empty() {
-        return !this.data;
-    }
-}
-
 class EventSource extends EventEmitter {
-    constructor(url, options = {}) {
-        super();
+  constructor(url, options = {}) {
+    super();
 
-        this.options = {...DefaultOptions, ...options};
-        this.url = url;
-        this.readyState = ReadyStates.DISCONNECTED;
-        this.lastEventId = null;
-        this.heartbeatTimeout = null;
+    this.options = {...DefaultOptions, ...options};
+    this.url = url;
+    this.readyState = ReadyStates.DISCONNECTED;
+    this.lastEventId = null;
+    this.heartbeatTimeout = null;
 
-        this.backoff = backoff.exponential({
-            initialDelay: this.options.initialReconnectDelay,
-            maxDelay: this.options.maximumReconnectDelay,
-        });
-        this.backoff.on('ready', () => this.connect());
+    this.backoff = backoff.exponential({
+      initialDelay: this.options.initialReconnectDelay,
+      maxDelay: this.options.maximumReconnectDelay,
+    });
+    this.backoff.on('ready', () => this.connect());
 
-        this.connect();
+    this.connect();
+  }
+
+  async connect() {
+    if ([ReadyStates.CONNECTING, ReadyStates.CONNECTED].includes(this.readyState)) return;
+    this.readyState = ReadyStates.CONNECTING;
+    this.emit('connecting');
+
+    const headers = {};
+    if (this.lastEventId) {
+      headers['Last-Event-ID'] = this.lastEventId;
     }
 
-    connect() {
-        if ([ReadyStates.CONNECTING, ReadyStates.CONNECTED].includes(this.readyState)) return;
-        this.readyState = ReadyStates.CONNECTING;
-        this.emit('connecting');
+    try {
+      await undici.stream(this.url, {headers}, (response) => this.handleResponse(response));
+    } catch (err) {
+      this.emit('error', err);
+    }
 
-        const headers = {};
-        if (this.lastEventId) {
-            headers['Last-Event-ID'] = this.lastEventId;
+    this.emit('disconnected');
+    this.readyState = ReadyStates.DISCONNECTED;
+    try {
+      this.backoff.backoff();
+    } catch (_) {}
+  }
+
+  resetHeartbeatTimeout(callback) {
+    if (this.heartbeatInterval != null) {
+      this.lastHeartbeat = Date.now();
+      return;
+    }
+    this.heartbeatInterval = setInterval(() => {
+      if (this.lastHeartbeat > Date.now() - this.options.heartbeatTimeout) {
+        return;
+      }
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+      callback(new Error(`no heartbeat from server in ${this.options.heartbeatTimeout}ms`));
+    }, this.options.heartbeatTimeout);
+  }
+
+  handleResponse({statusCode, headers}) {
+    if (statusCode !== 200) {
+      throw new Error(`response not OK. status code: ${statusCode}`);
+    }
+
+    const contentType = headers['content-type'];
+    if (!contentType.includes('text/event-stream')) {
+      throw new Error(`response content type not text/event-stream: ${contentType}`);
+    }
+
+    let eventId = null;
+    let eventName = '';
+    let eventData = '';
+    const parseEventStreamLine = (buffer, position, fieldLength, lineLength) => {
+      if (lineLength === 0) {
+        if (eventData.length > 0) {
+          this.emit(eventName || 'message', {
+            id: eventId,
+            name: eventName,
+            data: eventData.slice(0, -1), // trim trailing new line
+          });
+          eventData = '';
+        }
+        if (eventId != null) {
+          this.lastEventId = eventId;
+          eventId = null;
+        }
+        eventName = null;
+      } else if (fieldLength > 0) {
+        const emptyValue = fieldLength < 0;
+        let step = 0;
+        const field = buffer.slice(position, position + (emptyValue ? lineLength : fieldLength)).toString();
+
+        if (emptyValue) {
+          step = lineLength;
+        } else if (buffer[position + fieldLength + 1] !== SPACE_CHARACTER) {
+          step = fieldLength + 1;
+        } else {
+          step = fieldLength + 2;
+        }
+        position += step;
+
+        const valueLength = lineLength - step;
+        const value = buffer.slice(position, position + valueLength).toString();
+
+        if (field === 'data') {
+          eventData += value + '\n';
+        } else if (field === 'event') {
+          eventName = value;
+        } else if (field === 'id') {
+          eventId = value;
+        }
+      }
+    }
+
+    let buffer;
+    let discardTrailingNewline = false;
+
+    const writable = new Writable({
+      write(chunk, encoding, callback) {
+        buffer = buffer != null ? Buffer.concat([buffer, chunk]) : chunk;
+
+        let position = 0;
+        let bufferLength = buffer.length;
+
+        while (position < bufferLength) {
+          if (discardTrailingNewline) {
+            if (buffer[position] === LINE_FEED_CHARACTER) {
+              ++position;
+            }
+            discardTrailingNewline = false;
+          }
+
+          let lineLength = -1;
+          let fieldLength = -1;
+
+          for (let bufferIndex = position; lineLength < 0 && bufferIndex < bufferLength; ++bufferIndex) {
+            const character = buffer[bufferIndex];
+            if (character === COLON_CHARACTER) {
+              if (fieldLength < 0) {
+                fieldLength = bufferIndex - position;
+              }
+            } else if (character === CARRIAGE_RETURN_CHARACTER) {
+              discardTrailingNewline = true;
+              lineLength = bufferIndex - position;
+            } else if (character === LINE_FEED_CHARACTER) {
+              lineLength = bufferIndex - position;
+            }
+          }
+
+          if (lineLength < 0) {
+            break;
+          }
+
+          parseEventStreamLine(buffer, position, fieldLength, lineLength);
+
+          position += lineLength + 1;
         }
 
-        fetch(this.url, {headers})
-        .then(response => this.handleResponse(response))
-        .catch(err => this.emit('error', err))
-        .then(() => {
-            this.emit('disconnected');
-            this.readyState = ReadyStates.DISCONNECTED;
-            try {
-                this.backoff.backoff();
-            } catch (_) {}
-        });
-    }
-
-    resetHeartbeatTimeout(callback) {
-        if (this.heartbeatTimeout) {
-            clearTimeout(this.heartbeatTimeout);
+        if (position === bufferLength) {
+          buffer = null;
+        } else if (position > 0) {
+          buffer = buffer.slice(position);
         }
-        this.heartbeatTimeout = setTimeout(
-            () => callback(new Error(`no heartbeat from server in ${this.options.heartbeatTimeout}ms`)),
-            this.options.heartbeatTimeout
-        );
-    }
 
-    handleResponse(response) {
-        return new Promise((resolve, reject) => {
-            if (!response.ok) {
-                response
-                    .text()
-                    .then(body => reject(new Error(`response not OK. status code: ${response.status} body: ${body}`)));
-                return;
-            }
+        callback();
+      },
+    });
 
-            const contentType = response.headers.get('Content-Type');
-            if (!contentType.includes('text/event-stream')) {
-                reject(new Error(`response content type not text/event-stream: ${contentType}`));
-                return;
-            }
+    this.backoff.reset();
+    this.resetHeartbeatTimeout((err) => writable.destroy(err));
+    this.readyState = ReadyStates.CONNECTED;
+    this.emit('connected');
 
-            response.body.on('error', err => reject(new Error(`error when reading from response: ${err.message}`)));
-            response.body.on('end', () => resolve());
-
-            let buffer = '';
-            response.body.on('data', chunk => {
-                this.resetHeartbeatTimeout(err => response.body.destroy(err));
-
-                buffer += chunk.toString('utf8');
-
-                const bufferedEvents = buffer.split(EVENT_ENDING_REGEX);
-                if (bufferedEvents.length < 2) return;
-
-                for (let i = 0; i < bufferedEvents.length - 1; i++) {
-                    const bufferedEvent = bufferedEvents[i];
-                    if (!bufferedEvent.length) continue;
-
-                    const event = new EventSourceEvent(bufferedEvent);
-                    if (!event.empty) this.emit(event.name, event);
-                    if (event.id) this.lastEventId = event.id;
-                }
-
-                buffer = '';
-            });
-
-            this.backoff.reset();
-            this.readyState = ReadyStates.CONNECTED;
-            this.emit('connected');
-        });
-    }
+    return writable;
+  }
 }
 
 module.exports = EventSource;
