@@ -63,10 +63,7 @@ class EventSource extends EventEmitter {
   }
 
   resetHeartbeatTimeout(callback) {
-    if (this.heartbeatInterval != null) {
-      this.lastHeartbeat = Date.now();
-      return;
-    }
+    if (this.heartbeatInterval != null) return;
     this.heartbeatInterval = setInterval(() => {
       if (this.lastHeartbeat > Date.now() - this.options.heartbeatTimeout) {
         return;
@@ -75,6 +72,10 @@ class EventSource extends EventEmitter {
       this.heartbeatInterval = null;
       callback(new Error(`no heartbeat from server in ${this.options.heartbeatTimeout}ms`));
     }, this.options.heartbeatTimeout);
+
+    return () => {
+      this.lastHeartbeat = Date.now();
+    };
   }
 
   handleResponse({statusCode, headers}) {
@@ -132,6 +133,7 @@ class EventSource extends EventEmitter {
       }
     }
 
+    let heartbeat;
     let buffer;
     let discardTrailingNewline = false;
 
@@ -182,12 +184,14 @@ class EventSource extends EventEmitter {
           buffer = buffer.slice(position);
         }
 
+        heartbeat?.();
+
         callback();
       },
     });
 
     this.backoff.reset();
-    this.resetHeartbeatTimeout((err) => writable.destroy(err));
+    heartbeat = this.resetHeartbeatTimeout((err) => writable.destroy(err));
     this.readyState = ReadyStates.CONNECTED;
     this.emit('connected');
 
