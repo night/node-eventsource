@@ -4,7 +4,7 @@
   "version": "0.0.2",
   "dependencies": {
     "backoff": "^2.5.0",
-    "undici": "^5.10.0"
+    "undici": "^5.16.0"
   },
   "main": "./eventsource.js",
   "license": "MIT",
